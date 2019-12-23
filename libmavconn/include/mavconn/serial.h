@@ -43,8 +43,9 @@ public:
 	~MAVConnSerial();
 
 	void close() override;
+    bool connect(const std::string& device, unsigned baudrate, bool hwflow);
 
-	void send_message(const mavlink::mavlink_message_t *message) override;
+        void send_message(const mavlink::mavlink_message_t *message) override;
 	void send_message(const mavlink::Message &message, const uint8_t source_compid) override;
 	void send_bytes(const uint8_t *bytes, size_t length) override;
 
@@ -58,11 +59,18 @@ private:
 	boost::asio::serial_port serial_dev;
 
 	std::atomic<bool> tx_in_progress;
-	std::deque<MsgBuffer> tx_q;
-	std::array<uint8_t, MsgBuffer::MAX_SIZE> rx_buf;
+        std::deque<MsgBuffer> tx_q;
+        std::array<uint8_t, MsgBuffer::MAX_SIZE> rx_buf;
 	std::recursive_mutex mutex;
 
-	void do_read();
+        std::atomic<bool> serialIsConnected;
+
+        void do_read();
+
+    std::string devicePath;
+    unsigned baudrate;
+    bool hwflow;
+
 	void do_write(bool check_tx_state);
 };
 }	// namespace mavconn

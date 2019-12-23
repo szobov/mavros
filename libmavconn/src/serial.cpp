@@ -21,12 +21,13 @@
 #include <mavconn/thread_utils.h>
 #include <mavconn/serial.h>
 
+#include <boost/filesystem.hpp>
+
 #if defined(__linux__)
 #include <linux/serial.h>
 #endif
 
 namespace mavconn {
-
 using boost::system::error_code;
 using boost::asio::io_service;
 using boost::asio::buffer;
@@ -38,17 +39,38 @@ using mavlink::mavlink_message_t;
 
 
 MAVConnSerial::MAVConnSerial(uint8_t system_id, uint8_t component_id,
-		std::string device, unsigned baudrate, bool hwflow) :
+	std::string device, unsigned baudrate, bool hwflow) :
 	MAVConnInterface(system_id, component_id),
 	tx_in_progress(false),
 	tx_q {},
 	rx_buf {},
+	serialIsConnected(false),
+	devicePath(device),
+	baudrate(baudrate),
+	hwflow(hwflow),
 	io_service(),
 	serial_dev(io_service)
 {
+	// NOTE: shared_from_this() should not be used in constructors
+
+	this->connect(device, baudrate, hwflow);
+
+	// give some work to io_service before start
+	io_service.post(std::bind(&MAVConnSerial::do_read, this));
+
+	// run io_service for async io
+	io_thread = std::thread([this] () {
+			utils::set_this_thread_name("mserial%zu", conn_id);
+			io_service.run();
+		});
+}
+
+bool MAVConnSerial::connect(const std::string &device, unsigned baudrate,
+	bool hwflow) {
 	using SPB = boost::asio::serial_port_base;
 
-	CONSOLE_BRIDGE_logInform(PFXd "device: %s @ %d bps", conn_id, device.c_str(), baudrate);
+	CONSOLE_BRIDGE_logInform(PFXd "device: %s @ %d bps", conn_id, device.c_str(),
+		baudrate);
 
 	try {
 		serial_dev.open(device);
@@ -102,21 +124,13 @@ MAVConnSerial::MAVConnSerial(uint8_t system_id, uint8_t component_id,
 			ioctl(fd, TIOCSSERIAL, &ser_info);
 		}
 #endif
+    this->serialIsConnected = true;
+		return true;
 	}
 	catch (boost::system::system_error &err) {
+		return false;
 		throw DeviceError("serial", err);
 	}
-
-	// NOTE: shared_from_this() should not be used in constructors
-
-	// give some work to io_service before start
-	io_service.post(std::bind(&MAVConnSerial::do_read, this));
-
-	// run io_service for async io
-	io_thread = std::thread([this] () {
-				utils::set_this_thread_name("mserial%zu", conn_id);
-				io_service.run();
-			});
 }
 
 MAVConnSerial::~MAVConnSerial()
@@ -124,24 +138,44 @@ MAVConnSerial::~MAVConnSerial()
 	close();
 }
 
+using namespace std::chrono_literals;
+
 void MAVConnSerial::close()
 {
-	lock_guard lock(mutex);
-	if (!is_open())
-		return;
+	if (this->serialIsConnected) {
+		this->serialIsConnected = false;
+    CONSOLE_BRIDGE_logInform(PFXd "Closing serial device");
+		this->serial_dev.cancel();
+		this->serial_dev.close();
+	}
 
-	serial_dev.cancel();
-	serial_dev.close();
 
-	io_service.stop();
+	while (!boost::filesystem::exists(this->devicePath)) {
+		std::this_thread::sleep_for(10ms);
+	};
 
-	if (io_thread.joinable())
-		io_thread.join();
 
-	io_service.reset();
+	while (!this->connect(this->devicePath, this->baudrate, this->hwflow)) {
+		std::this_thread::sleep_for(10ms);
+	}
 
-	if (port_closed_cb)
-		port_closed_cb();
+
+	// lock_guard lock(mutex);
+	// if (!is_open())
+	//      return;
+
+	// serial_dev.cancel();
+	// serial_dev.close();
+
+	// io_service.stop();
+
+	// if (io_thread.joinable())
+	//      io_thread.join();
+
+	// io_service.reset();
+
+	// if (port_closed_cb)
+	//      port_closed_cb();
 }
 
 void MAVConnSerial::send_bytes(const uint8_t *bytes, size_t length)
@@ -208,21 +242,25 @@ void MAVConnSerial::do_read(void)
 {
 	auto sthis = shared_from_this();
 	serial_dev.async_read_some(
-			buffer(rx_buf),
-			[sthis] (error_code error, size_t bytes_transferred) {
-				if (error) {
-					CONSOLE_BRIDGE_logError(PFXd "receive: %s", sthis->conn_id, error.message().c_str());
-					sthis->close();
-					return;
-				}
-
-				sthis->parse_buffer(PFX, sthis->rx_buf.data(), sthis->rx_buf.size(), bytes_transferred);
+		buffer(rx_buf),
+		[sthis] (error_code error, size_t bytes_transferred) {
+			if (error) {
+				CONSOLE_BRIDGE_logError(PFXd "receive: %s", sthis->conn_id, error.message().c_str());
+				sthis->close();
 				sthis->do_read();
-			});
+				return;
+			}
+
+			sthis->parse_buffer(PFX, sthis->rx_buf.data(), sthis->rx_buf.size(), bytes_transferred);
+			sthis->do_read();
+		});
 }
 
 void MAVConnSerial::do_write(bool check_tx_state)
 {
+	if (!this->serialIsConnected) {
+		return;
+	}
 	if (check_tx_state && tx_in_progress)
 		return;
 
@@ -234,33 +272,35 @@ void MAVConnSerial::do_write(bool check_tx_state)
 	auto sthis = shared_from_this();
 	auto &buf_ref = tx_q.front();
 	serial_dev.async_write_some(
-			buffer(buf_ref.dpos(), buf_ref.nbytes()),
-			[sthis, &buf_ref] (error_code error, size_t bytes_transferred) {
-				assert(bytes_transferred <= buf_ref.len);
+		buffer(buf_ref.dpos(), buf_ref.nbytes()),
+		[sthis, &buf_ref](error_code error, size_t bytes_transferred) {
+			assert(bytes_transferred <= buf_ref.len);
 
-				if (error) {
-					CONSOLE_BRIDGE_logError(PFXd "write: %s", sthis->conn_id, error.message().c_str());
-					sthis->close();
-					return;
-				}
+			if (error) {
+				CONSOLE_BRIDGE_logError(PFXd "write: %s", sthis->conn_id,
+				error.message().c_str());
+				sthis->close();
+				sthis->do_write(false);
+				return;
+			}
 
-				sthis->iostat_tx_add(bytes_transferred);
-				lock_guard lock(sthis->mutex);
+			sthis->iostat_tx_add(bytes_transferred);
+			lock_guard lock(sthis->mutex);
 
-				if (sthis->tx_q.empty()) {
-					sthis->tx_in_progress = false;
-					return;
-				}
+			if (sthis->tx_q.empty()) {
+				sthis->tx_in_progress = false;
+				return;
+			}
 
-				buf_ref.pos += bytes_transferred;
-				if (buf_ref.nbytes() == 0) {
-					sthis->tx_q.pop_front();
-				}
+			buf_ref.pos += bytes_transferred;
+			if (buf_ref.nbytes() == 0) {
+				sthis->tx_q.pop_front();
+			}
 
-				if (!sthis->tx_q.empty())
-					sthis->do_write(false);
-				else
-					sthis->tx_in_progress = false;
-			});
+			if (!sthis->tx_q.empty())
+				sthis->do_write(false);
+			else
+				sthis->tx_in_progress = false;
+		});
 }
 }	// namespace mavconn
